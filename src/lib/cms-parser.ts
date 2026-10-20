@@ -175,34 +175,75 @@ export function normalizeTitle(s: string): string {
   return s.toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
 }
 
-/**
- * 相关性判断：结果标题是否真的命中了搜索词。
- * 部分采集站会做分词/OR 模糊搜索（搜「摔跤吧！爸爸」返回一堆「爸爸XXX」），
- * 逐条校验后只保留真正相关的结果。
- *
- * 规则：归一化后的标题包含归一化后的完整关键词；
- * 多词查询（空格分隔）时放宽为「每个词都命中」即可（如「钢铁侠 2008」）。
- */
-export function isRelevant(name: string, wd: string): boolean {
-  const nName = normalizeTitle(name);
-  const nWd = normalizeTitle(wd);
-  if (!nName || !nWd) return true; // 空关键词不参与过滤
-  if (nName.includes(nWd)) return true;
-  const tokens = wd.trim().split(/\s+/);
-  if (tokens.length > 1) {
-    return tokens.every((t) => {
-      const n = normalizeTitle(t);
-      return n && nName.includes(n);
-    });
+/** 仅将独立数字或明确的「第 N 季」后缀作为季数别名。 */
+function parseSeasonSuffix(title: string, allowAnnotations = false): { base: string; season: number; explicit: boolean } | undefined {
+  const explicitPattern = allowAnnotations
+    ? /^(.*?)\s*第\s*([1-9]\d?|[一二两三四五六七八九十]{1,3})\s*季(?:\s+.*|[【[(（].*)?$/u
+    : /^(.*?)\s*第\s*([1-9]\d?|[一二两三四五六七八九十]{1,3})\s*季$/u;
+  const explicit = title.trim().match(explicitPattern);
+  const bare = title.trim().match(/^(.*?)\s+([1-9]\d?)$/u);
+  const match = explicit ?? bare;
+  if (!match || !normalizeTitle(match[1])) return undefined;
+  const value = match[2];
+  const digits = '零一二三四五六七八九';
+  let season = Number(value);
+  if (!Number.isFinite(season)) {
+    const chinese = value.replace('两', '二');
+    if (/^[一二三四五六七八九]$/u.test(chinese)) {
+      season = digits.indexOf(chinese);
+    } else if (/^[一二三四五六七八九]?十[一二三四五六七八九]?$/u.test(chinese)) {
+      const [tens, units] = chinese.split('十');
+      season = (tens ? digits.indexOf(tens) : 1) * 10 + (units ? digits.indexOf(units) : 0);
+    }
+  }
+  if (!Number.isFinite(season)) return undefined;
+  return { base: match[1], season, explicit: Boolean(explicit) };
+}
+
+/** 数字必须完整命中，避免第 2 季误匹配 12 或 20。 */
+function includesKeyword(title: string, keyword: string): boolean {
+  let index = title.indexOf(keyword);
+  while (index >= 0) {
+    const before = title[index - 1] ?? '';
+    const after = title[index + keyword.length] ?? '';
+    if ((!/^\d/u.test(keyword) || !/\d/u.test(before)) &&
+        (!/\d$/u.test(keyword) || !/\d/u.test(after))) return true;
+    index = title.indexOf(keyword, index + 1);
   }
   return false;
 }
 
+function matchesKeyword(name: string, wd: string): boolean {
+  const nName = normalizeTitle(name);
+  const nWd = normalizeTitle(wd);
+  if (includesKeyword(nName, nWd)) return true;
+  const tokens = wd.trim().split(/\s+/);
+  return tokens.length > 1 && tokens.every((token) => {
+    const normalized = normalizeTitle(token);
+    return Boolean(normalized) && includesKeyword(nName, normalized);
+  });
+}
+
 /**
- * 结果相关性过滤：丢弃与关键词无关的条目。
- * 过滤后为空时回退到原列表——宁可多展示也不把源站唯一可用的结果清空。
+ * 忽略标点和大小写，多词查询要求每个词都命中。
+ * 独立的末尾数字也可匹配明确的中文季数后缀；
+ * 标题内部的数字与四位年份不作为季数别名。
  */
+export function isRelevant(name: string, wd: string): boolean {
+  if (!normalizeTitle(wd)) return true;
+  if (!normalizeTitle(name)) return false;
+  const querySeason = parseSeasonSuffix(wd);
+  const titleSeason = parseSeasonSuffix(name, true);
+  if (querySeason && titleSeason) {
+    if (querySeason.season !== titleSeason.season) return false;
+    if (querySeason.explicit || titleSeason.explicit) {
+      return matchesKeyword(titleSeason.base, querySeason.base);
+    }
+  }
+  return matchesKeyword(name, wd);
+}
+
+/** 丢弃无关结果；即使全部不相关，也不能返回源站的原始目录。 */
 export function filterRelevantResults<T extends { name?: string }>(items: T[], wd: string): T[] {
-  const filtered = items.filter((item) => isRelevant(item.name || '', wd));
-  return filtered.length > 0 ? filtered : items;
+  return items.filter((item) => isRelevant(item.name || '', wd));
 }
